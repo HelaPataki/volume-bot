@@ -31,6 +31,8 @@ CALM_MAX = 2.5           # «тихо»: за 30 свечей до сигнал�
 MIN_VOL_USD = 100_000    # объём сигнальной свечи не меньше $100k
 MIN_NORM_USD = 10_000    # «норма» монеты не меньше $10k за свечу (отсев совсем мёртвых)
 COOLDOWN_C = 60          # 10 суток (60 свечей) без повторных сигналов по монете
+STABLES = {"USDC", "USDT", "FDUSD", "TUSD", "DAI", "USDE", "USD1", "BUSD", "USDP", "PYUSD", "USDS", "RLUSD", "EURI", "AEUR", "XUSD", "USDD"}
+HISTORY_HORIZON_C = 120   # в истории следим 20 суток (120 свечей), чтобы проверить, бывает ли эффект позже 10 суток
 HORIZON_C = 60           # окно слежки: 10 суток (60 свечей)
 HISTORY_START = "2025-01-01"
 CONTROL_P = 0.01         # доля «тихих» свечей, берущихся в контрольную группу
@@ -50,7 +52,7 @@ COLS = [
     "kind", "coin", "symbol", "time_utc", "candle_ts",
     "price", "candle_pct",
     "vol_usd", "norm_usd", "above_pct", "above_x", "peak30_x", "sleep", "cap_usd",
-    "up_pct", "up_days", "dn_pct", "dn_days", "move_pct",
+    "up_pct", "up_days", "dn_pct", "dn_days", "move_pct", "move10_pct",
     "big10_days", "big10_dir", "big20_days", "big20_dir",
     "volmax_x", "volmax_days", "complete", "status", "checked_utc",
 ]
@@ -64,11 +66,11 @@ RU = {
     "cap_usd": "Капитализация ($)",
     "up_pct": "Макс. рост (%)", "up_days": "Дней до макс. роста",
     "dn_pct": "Макс. падение (%)", "dn_days": "Дней до макс. падения",
-    "move_pct": "Макс. движение (%)",
+    "move_pct": "Макс. движение (%)", "move10_pct": "Движение за 10 сут. (%)",
     "big10_days": "Дней до ±10%", "big10_dir": "Куда ±10%",
     "big20_days": "Дней до ±20%", "big20_dir": "Куда ±20%",
     "volmax_x": "Макс. объём после (×норма)", "volmax_days": "Дней до макс. объёма",
-    "complete": "10 суток прошли", "status": "Статус", "checked_utc": "Проверено (UTC)",
+    "complete": "Наблюдение завершено", "status": "Статус", "checked_utc": "Проверено (UTC)",
 }
 
 
@@ -173,7 +175,10 @@ def build_universe():
             continue
         if not m.get("is_perpetual") or m.get("quote_asset") != "USDT":
             continue
-        bases.append(m.get("base_asset", "").upper())
+        b = m.get("base_asset", "").upper()
+        if b in STABLES:
+            continue
+        bases.append(b)
     caps = mcaps()
     valid = {x["symbol"] for x in get_json(SPOT + "/api/v3/ticker/price")}
     uni = {}
@@ -267,19 +272,22 @@ def is_quiet(s):
     return bool(s) and s["mult"] < 1.5 and s["calm"] <= CALM_MAX and s["norm"] >= MIN_NORM_USD
 
 
-def outcomes(cs, i, norm):
+def outcomes(cs, i, norm, horizon=HORIZON_C):
     """Что было после свечи i (вход = закрытие этой свечи) в пределах 10 суток."""
     entry = cs[i]["c"]
-    fut = cs[i + 1:i + 1 + HORIZON_C]
+    fut = cs[i + 1:i + 1 + horizon]
     if not fut or entry <= 0:
         return None
     up = dn = 0.0
     up_k = dn_k = 0
+    up10 = dn10 = 0.0
     first = {10: None, 20: None}
     vmax, vmax_k = 0.0, 0
     for k, c in enumerate(fut):
         hi = (c["h"] / entry - 1) * 100
         lo = (c["l"] / entry - 1) * 100
+        if k < HORIZON_C:
+            up10, dn10 = max(up10, hi), min(dn10, lo)
         if hi > up:
             up, up_k = hi, k
         if lo < dn:
@@ -292,11 +300,11 @@ def outcomes(cs, i, norm):
     d = lambda k: round(k * CANDLE_S / 86400, 2)
     out = {
         "up_pct": rnd(up), "up_days": d(up_k), "dn_pct": rnd(dn), "dn_days": d(dn_k),
-        "move_pct": rnd(max(up, -dn)),
+        "move_pct": rnd(max(up, -dn)), "move10_pct": rnd(max(up10, -dn10)),
         "big10_days": d(first[10][0]) if first[10] else "", "big10_dir": first[10][1] if first[10] else "",
         "big20_days": d(first[20][0]) if first[20] else "", "big20_dir": first[20][1] if first[20] else "",
         "volmax_x": rnd(vmax, 1), "volmax_days": d(vmax_k),
-        "complete": "да" if len(fut) >= HORIZON_C else "нет",
+        "complete": "да" if len(fut) >= horizon else "нет",
     }
     return out
 
@@ -355,9 +363,10 @@ def group_stats(label, rows):
     if not done:
         return f"{label}: завершённых наблюдений пока нет"
     n = len(done)
-    moves = [num(r["move_pct"]) for r in done if num(r["move_pct"]) is not None]
-    b10 = [r for r in done if num(r.get("big10_days")) is not None]
-    b20 = [r for r in done if num(r.get("big20_days")) is not None]
+    mv = lambda r: num(r.get("move10_pct")) if num(r.get("move10_pct")) is not None else num(r.get("move_pct"))
+    moves = [mv(r) for r in done if mv(r) is not None]
+    b10 = [r for r in done if num(r.get("big10_days")) is not None and num(r["big10_days"]) <= 10]
+    b20 = [r for r in done if num(r.get("big20_days")) is not None and num(r["big20_days"]) <= 10]
     up10 = sum(1 for r in b10 if r.get("big10_dir") == "вверх")
     lines = [
         f"{label}: {n} шт.",
@@ -394,11 +403,11 @@ def cmd_history():
                 continue
             if is_signal(s, MULT_MIN):
                 if i - last_event >= COOLDOWN_C:
-                    out = outcomes(cs, i, s["norm"])
+                    out = outcomes(cs, i, s["norm"], HISTORY_HORIZON_C)
                     events.append(make_row("сигнал", sym, info["base"], info["cap"], cs, i, s, out, "история"))
                     last_event = i
-            elif is_quiet(s) and i + HORIZON_C < len(cs) and rng.random() < CONTROL_P:
-                out = outcomes(cs, i, s["norm"])
+            elif is_quiet(s) and i + HISTORY_HORIZON_C < len(cs) and rng.random() < CONTROL_P:
+                out = outcomes(cs, i, s["norm"], HISTORY_HORIZON_C)
                 control.append(make_row("контроль", sym, info["base"], info["cap"], cs, i, s, out, "история"))
         if n_coin % 25 == 0:
             print(f"обработано монет: {n_coin}/{len(uni)}, сигналов: {len(events)}")
@@ -421,6 +430,18 @@ def cmd_history():
         lines.append("")
         lines.append(group_stats(f"Вспышка от ×{t}", grp))
         lines.append(f"  сигналов в сутки по всему рынку: ≈{len(grp) / days:.1f}")
+    lines += ["", "Доля с движением ±10% к 10 / 14 / 20 суткам (окно слежки 20 суток):"]
+    for label, grp in (("контроль", control), ("вспышка от ×3", events),
+                       ("вспышка от ×5", [r for r in events if (num(r["above_x"]) or 0) >= 5]),
+                       ("вспышка от ×10", [r for r in events if (num(r["above_x"]) or 0) >= 10])):
+        done = [r for r in grp if r.get("complete") == "да"]
+        if not done:
+            continue
+        sh = []
+        for dd in (10, 14, 20):
+            k = sum(1 for r in done if num(r.get("big10_days")) is not None and num(r["big10_days"]) <= dd)
+            sh.append(f"{k / len(done) * 100:.0f}%")
+        lines.append(f"  {label} ({len(done)}): " + " / ".join(sh))
     text = "\n".join(lines)
     with open(HISTORY_SUMMARY, "w", encoding="utf-8") as f:
         f.write(text)
