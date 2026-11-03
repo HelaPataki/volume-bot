@@ -53,7 +53,7 @@ ST_OPEN = "в процессе"
 ST_DONE = "завершено"
 
 COLS = [
-    "kind", "coin", "symbol", "time_utc", "candle_ts",
+    "kind", "coin", "symbol", "time_utc", "time_kyiv", "candle_ts",
     "price", "candle_pct",
     "vol_usd", "norm_usd", "above_pct", "above_x", "peak30_x", "sleep", "cap_usd",
     "up_pct", "up_days", "dn_pct", "dn_days", "move_pct", "move10_pct",
@@ -64,7 +64,7 @@ COLS = [
 ]
 RU = {
     "kind": "Тип", "coin": "Монета", "symbol": "Пара (спот)",
-    "time_utc": "Свеча (UTC)", "candle_ts": "Метка времени",
+    "time_utc": "Свеча (UTC)", "time_kyiv": "Свеча (Киев)", "candle_ts": "Метка времени",
     "price": "Цена закрытия", "candle_pct": "Свеча (%)",
     "vol_usd": "Объём свечи ($)", "norm_usd": "Норма ($)",
     "above_pct": "Выше нормы (%)", "above_x": "Выше нормы (×)",
@@ -76,7 +76,7 @@ RU = {
     "big10_days": "Дней до ±10%", "big10_dir": "Куда ±10%",
     "big20_days": "Дней до ±20%", "big20_dir": "Куда ±20%",
     "volmax_x": "Макс. объём после (×норма)", "volmax_days": "Дней до макс. объёма",
-    "complete": "Наблюдение завершено", "status": "Статус", "checked_utc": "Проверено (UTC)",
+    "complete": "Наблюдение завершено", "status": "Статус", "checked_utc": "Проверено (Киев)",
     "oi_usd": "ОИ ($)", "oi4_pct": "ОИ за 4ч (%)", "oi24_pct": "ОИ за 24ч (%)",
     "oi_mcap_pct": "ОИ / капа (%)", "funding_pct": "Фандинг (%)", "ls_ratio": "Лонг/шорт (соотн.)",
     "liq_long_usd": "Ликвид. лонгов 4ч ($)", "liq_short_usd": "Ликвид. шортов 4ч ($)",
@@ -88,6 +88,15 @@ RU = {
 
 def ts_str(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def kyiv_str(ts, fmt="%Y-%m-%d %H:%M"):
+    """Время по Киеву (зимой UTC+2, летом UTC+3)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(ts, ZoneInfo("Europe/Kyiv")).strftime(fmt)
+    except Exception:
+        return datetime.fromtimestamp(ts + 2 * 3600, timezone.utc).strftime(fmt)
 
 
 def sig(x, digits=6):
@@ -326,7 +335,7 @@ def make_row(kind, sym, base, cap, cs, i, s, out, status=""):
     c = cs[i]
     row = {
         "kind": kind, "coin": base, "symbol": sym,
-        "time_utc": ts_str(c["t"]), "candle_ts": c["t"],
+        "time_utc": ts_str(c["t"]), "time_kyiv": kyiv_str(c["t"]), "candle_ts": c["t"],
         "price": sig(c["c"]),
         "candle_pct": rnd((c["c"] / c["o"] - 1) * 100) if c["o"] else "",
         "vol_usd": int(s["vol"]), "norm_usd": int(s["norm"]),
@@ -597,6 +606,7 @@ def cmd_monitor():
         lines.append(
             f"{mark}{info['base']}: объём {money(s['vol'])} | норма {money(s['norm'])} | "
             f"+{(s['mult'] - 1) * 100:.0f}% (×{s['mult']:.1f}) | свеча {pct:+.1f}% | кап {money(info['cap'])}"
+            f" | {kyiv_str(c['t'], '%H:%M')}–{kyiv_str(c['t'] + CANDLE_S, '%H:%M')} Киев"
         )
     write_csv(SIGNALS_FILE, rows)
     lines.sort(key=lambda x: not x.startswith("🔥"))
@@ -630,7 +640,7 @@ def cmd_check():
             continue
         r.update(out)
         r["status"] = ST_DONE if out["complete"] == "да" else ST_OPEN
-        r["checked_utc"] = ts_str(now)
+        r["checked_utc"] = kyiv_str(now)
         changed = True
     if changed:
         write_csv(SIGNALS_FILE, rows)
