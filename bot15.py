@@ -38,7 +38,9 @@ COLS = [
     "peak96_x", "cap_usd",
     "up_pct", "up_hours", "dn_pct", "dn_hours",
     "move6_pct", "move24_pct", "move48_pct",
-    "h_to_3", "dir_3", "h_to_5", "dir_5", "h_to_10", "dir_10", "complete",
+    "h_to_3", "dir_3", "h_to_5", "dir_5", "h_to_10", "dir_10",
+    "up2_h", "up3_h", "up4_h", "up5_h", "up7_h", "up10_h",
+    "dn2_h", "dn3_h", "dn5_h", "dn7_h", "dn10_h", "complete",
 ]
 RU = {
     "kind": "Тип", "coin": "Монета", "symbol": "Пара (спот)",
@@ -54,6 +56,10 @@ RU = {
     "h_to_3": "Часов до ±3%", "dir_3": "Куда ±3%",
     "h_to_5": "Часов до ±5%", "dir_5": "Куда ±5%",
     "h_to_10": "Часов до ±10%", "dir_10": "Куда ±10%",
+    "up2_h": "Часов до +2%", "up3_h": "Часов до +3%", "up4_h": "Часов до +4%",
+    "up5_h": "Часов до +5%", "up7_h": "Часов до +7%", "up10_h": "Часов до +10%",
+    "dn2_h": "Часов до −2%", "dn3_h": "Часов до −3%", "dn5_h": "Часов до −5%",
+    "dn7_h": "Часов до −7%", "dn10_h": "Часов до −10%",
     "complete": "Наблюдение завершено",
 }
 
@@ -87,6 +93,8 @@ def outcomes(cs, i):
     up = dn = 0.0
     up_k = dn_k = 0
     first = {lv: None for lv in LEVELS}
+    up_lv = {2: None, 3: None, 4: None, 5: None, 7: None, 10: None}
+    dn_lv = {2: None, 3: None, 5: None, 7: None, 10: None}
     moves = {}
     for k, c in enumerate(fut):
         hi = (c["h"] / entry - 1) * 100
@@ -95,6 +103,12 @@ def outcomes(cs, i):
             up, up_k = hi, k
         if lo < dn:
             dn, dn_k = lo, k
+        for lv in up_lv:
+            if up_lv[lv] is None and hi >= lv:
+                up_lv[lv] = k
+        for lv in dn_lv:
+            if dn_lv[lv] is None and lo <= -lv:
+                dn_lv[lv] = k
         for lv in LEVELS:
             if first[lv] is None and (hi >= lv or lo <= -lv):
                 first[lv] = (k, "вверх" if hi >= -lo else "вниз")
@@ -108,6 +122,10 @@ def outcomes(cs, i):
         "move48_pct": rnd(moves.get(192, max(up, -dn))),
         "complete": "да" if len(fut) >= HORIZON_C else "нет",
     }
+    for lv, k in up_lv.items():
+        out[f"up{lv}_h"] = h(k) if k is not None else ""
+    for lv, k in dn_lv.items():
+        out[f"dn{lv}_h"] = h(k) if k is not None else ""
     for lv in LEVELS:
         out[f"h_to_{lv}"] = h(first[lv][0]) if first[lv] else ""
         out[f"dir_{lv}"] = first[lv][1] if first[lv] else ""
