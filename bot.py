@@ -22,8 +22,12 @@ CZ = "https://api.coinalyze.net/v1"
 SPOT = "https://data-api.binance.vision"
 
 # ======================= НАСТРОЙКИ (можно менять) =======================
-MCAP_MIN = 20_000_000    # минимальная капитализация монеты
-LIVE_MULT = 5.0          # порог для живых алертов: объём свечи в N раз выше нормы
+MCAP_MIN = 20_000_000    # минимальная капитализация монеты для живого бота
+HISTORY_MCAP_MIN = 1_000_000  # для исторической проверки берём и мелкие монеты (от $1 млн)
+LIVE_MULT = 3.0          # порог для живых алертов: объём свечи в N раз выше нормы
+MIN_CANDLE_PCT = 4.0     # живые алерты: сама свеча не меньше 4% (вверх или вниз)
+STRONG_CANDLE_PCT = 7.0  # свеча от 7% помечается 🔥 (по истории самая сильная группа)
+MCAP_MAX = 400_000_000   # живые алерты: капитализация не выше $400 млн
 MULT_MIN = 3.0           # минимальный порог в исторической проверке
 NORM_N = 30              # норма = медиана объёма за последние 30 свечей (5 суток)
 LONG_N = 180             # длинная база (30 суток), нужна для столбца «Спячка»
@@ -55,6 +59,8 @@ COLS = [
     "up_pct", "up_days", "dn_pct", "dn_days", "move_pct", "move10_pct",
     "big10_days", "big10_dir", "big20_days", "big20_dir",
     "volmax_x", "volmax_days", "complete", "status", "checked_utc",
+    "oi_usd", "oi4_pct", "oi24_pct", "oi_mcap_pct", "funding_pct", "ls_ratio",
+    "liq_long_usd", "liq_short_usd", "btc4_pct", "btc24_pct",
 ]
 RU = {
     "kind": "Тип", "coin": "Монета", "symbol": "Пара (спот)",
@@ -71,6 +77,10 @@ RU = {
     "big20_days": "Дней до ±20%", "big20_dir": "Куда ±20%",
     "volmax_x": "Макс. объём после (×норма)", "volmax_days": "Дней до макс. объёма",
     "complete": "Наблюдение завершено", "status": "Статус", "checked_utc": "Проверено (UTC)",
+    "oi_usd": "ОИ ($)", "oi4_pct": "ОИ за 4ч (%)", "oi24_pct": "ОИ за 24ч (%)",
+    "oi_mcap_pct": "ОИ / капа (%)", "funding_pct": "Фандинг (%)", "ls_ratio": "Лонг/шорт (соотн.)",
+    "liq_long_usd": "Ликвид. лонгов 4ч ($)", "liq_short_usd": "Ликвид. шортов 4ч ($)",
+    "btc4_pct": "BTC 4ч (%)", "btc24_pct": "BTC 24ч (%)",
 }
 
 
@@ -150,9 +160,9 @@ def cz(path, **params):
 
 # ----------------------- список монет (вселенная) -----------------------
 
-def mcaps():
+def mcaps(min_cap=MCAP_MIN):
     res = {}
-    for page in range(1, 9):
+    for page in range(1, 25):
         data = get_json(
             "https://api.coingecko.com/api/v3/coins/markets",
             vs_currency="usd", order="market_cap_desc", per_page=250, page=page,
@@ -161,15 +171,16 @@ def mcaps():
             s = c["symbol"].upper()
             if c.get("market_cap") and s not in res:
                 res[s] = c["market_cap"]
-        if not data or (data[-1].get("market_cap") or 0) < MCAP_MIN:
+        if not data or (data[-1].get("market_cap") or 0) < min_cap:
             break
         time.sleep(3)
     return res
 
 
-def build_universe():
+def build_universe(min_cap=MCAP_MIN):
     """Монеты с бессрочным фьючерсом на Binance, капитализацией от порога и спот-парой."""
     bases = []
+    fsyms = {}
     for m in cz("/future-markets"):
         if not m.get("symbol", "").endswith(".A"):
             continue
@@ -179,16 +190,17 @@ def build_universe():
         if b in STABLES:
             continue
         bases.append(b)
-    caps = mcaps()
+        fsyms.setdefault(b, m["symbol"])
+    caps = mcaps(min_cap)
     valid = {x["symbol"] for x in get_json(SPOT + "/api/v3/ticker/price")}
     uni = {}
     for base in dict.fromkeys(bases):
         cap = caps.get(base) or caps.get(base.removeprefix("1000"))
-        if not cap or cap < MCAP_MIN:
+        if not cap or cap < min_cap:
             continue
         for cand in (base + "USDT", base.removeprefix("1000") + "USDT"):
             if cand in valid and cand.isascii():
-                uni[cand] = {"base": base, "cap": cap}
+                uni[cand] = {"base": base, "cap": cap, "fsym": fsyms.get(base, "")}
                 break
     return uni
 
@@ -203,7 +215,8 @@ def load_universe():
     try:
         with open(UNIVERSE_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        if time.time() - d["ts"] < 24 * 3600 and d["coins"]:
+        if (time.time() - d["ts"] < 24 * 3600 and d["coins"]
+                and all("fsym" in v for v in d["coins"].values())):
             return d["coins"]
     except Exception:
         pass
@@ -385,8 +398,7 @@ def group_stats(label, rows):
 def cmd_history():
     start = int(datetime.strptime(HISTORY_START, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
     now = int(time.time())
-    uni = build_universe()
-    save_universe(uni)
+    uni = build_universe(HISTORY_MCAP_MIN)
     print("монет в списке:", len(uni))
     rng = random.Random(42)
     events, control = [], []
@@ -449,6 +461,87 @@ def cmd_history():
     tg(text)
 
 
+# ----------------- доп. колонки для анализа (в Telegram не идут) -----------------
+
+def _last_before(h, ts, step, key="c"):
+    """Значение последней свечи, закрытой к моменту ts."""
+    ok = [x for x in h if x["t"] + step <= ts and x.get(key) is not None]
+    return max(ok, key=lambda x: x["t"])[key] if ok else None
+
+
+def enrich(hits, now):
+    """Для каждого сигнала собирает ОИ, фандинг, лонг/шорт, ликвидации и BTC.
+    Любая ошибка даёт пустые ячейки: сигнал и алерт от этого не страдают."""
+    extra = {}
+    fs = sorted({info.get("fsym") for _, info, *_ in hits if info.get("fsym")})
+    t_end_min = min(cs[i]["t"] + CANDLE_S for _, _, cs, i, _ in hits)
+    t_from = int(t_end_min - 26 * 3600)
+
+    def fetch(endpoint, interval, add=None):
+        out = {}
+        for k in range(0, len(fs), 20):
+            params = {"symbols": ",".join(fs[k:k + 20]), "interval": interval,
+                      "from": t_from, "to": now}
+            if add:
+                params.update(add)
+            try:
+                for item in cz("/" + endpoint, **params):
+                    out[item["symbol"]] = item.get("history", [])
+            except Exception as e:
+                print("не получил", endpoint, e)
+            time.sleep(1.6)
+        return out
+
+    oi = fetch("open-interest-history", "15min", {"convert_to_usd": "true"}) if fs else {}
+    fund = fetch("funding-rate-history", "1hour") if fs else {}
+    ls = fetch("long-short-ratio-history", "1hour") if fs else {}
+    liq = fetch("liquidation-history", "1hour", {"convert_to_usd": "true"}) if fs else {}
+    try:
+        btc = klines("BTCUSDT", limit=20)
+    except Exception as e:
+        print("не получил BTC", e)
+        btc = []
+
+    res = {}
+    for sym, info, cs, i, s in hits:
+        T = cs[i]["t"] + CANDLE_S
+        f = info.get("fsym")
+        r = {}
+        try:
+            h = oi.get(f, [])
+            now_v = _last_before(h, T, 900)
+            v4 = _last_before(h, T - 4 * 3600, 900)
+            v24 = _last_before(h, T - 24 * 3600, 900)
+            if now_v:
+                r["oi_usd"] = int(now_v)
+                r["oi_mcap_pct"] = rnd(now_v / info["cap"] * 100) if info.get("cap") else ""
+                if v4:
+                    r["oi4_pct"] = rnd((now_v / v4 - 1) * 100)
+                if v24:
+                    r["oi24_pct"] = rnd((now_v / v24 - 1) * 100)
+            fv = _last_before(fund.get(f, []), T, 3600)
+            if fv is not None:
+                r["funding_pct"] = sig(fv, 6)
+            lv = _last_before(ls.get(f, []), T, 3600, "r")
+            if lv is not None:
+                r["ls_ratio"] = rnd(lv, 3)
+            lh = [x for x in liq.get(f, []) if T - 4 * 3600 <= x["t"] < T]
+            if lh:
+                r["liq_long_usd"] = int(sum(x.get("l") or 0 for x in lh))
+                r["liq_short_usd"] = int(sum(x.get("s") or 0 for x in lh))
+            b_now = next((c for c in btc if c["t"] + CANDLE_S == T), None)
+            if b_now:
+                r["btc4_pct"] = rnd((b_now["c"] / b_now["o"] - 1) * 100)
+                b24 = next((c for c in btc if c["t"] + CANDLE_S == T - 20 * 3600), None)
+                if b24:
+                    r["btc24_pct"] = rnd((b_now["c"] / b24["o"] - 1) * 100)
+        except Exception as e:
+            print("доп. колонки для", sym, "не собраны:", e)
+        print("доп. колонки", sym, r)
+        res[sym] = r
+    return res
+
+
 def cmd_monitor():
     if os.environ.get("TEST") == "1":
         tg("✅ Тест: бот аномальных объёмов на связи")
@@ -457,6 +550,8 @@ def cmd_monitor():
     state = load_state()
     hits = []
     for sym, info in uni.items():
+        if info["cap"] < MCAP_MIN or info["cap"] > MCAP_MAX:
+            continue
         try:
             cs = closed_only(klines(sym, limit=LONG_N + 12), now)
         except Exception as e:
@@ -473,7 +568,13 @@ def cmd_monitor():
                 continue
             if cs[i]["t"] - state.get(sym, 0) < COOLDOWN_C * CANDLE_S:
                 continue
+            # как в истории: любая вспышка запускает 10 суток тишины по монете,
+            # а в таблицу и в Telegram попадают только подходящие по свече и капе
             state[sym] = cs[i]["t"]
+            c = cs[i]
+            cpct = abs((c["c"] / c["o"] - 1) * 100) if c["o"] else 0
+            if cpct < MIN_CANDLE_PCT or info["cap"] > MCAP_MAX:
+                continue
             hits.append((sym, info, cs, i, s))
     print("монет проверено:", len(uni), "сигналов:", len(hits))
     save_state(state)
@@ -481,17 +582,28 @@ def cmd_monitor():
         return
     rows = read_csv(SIGNALS_FILE)
     lines = []
+    try:
+        extras = enrich(hits, now)
+    except Exception as e:
+        print("доп. колонки: ошибка", e)
+        extras = {}
     for sym, info, cs, i, s in hits:
-        rows.append(make_row("сигнал", sym, info["base"], info["cap"], cs, i, s, None, ST_OPEN))
+        row = make_row("сигнал", sym, info["base"], info["cap"], cs, i, s, None, ST_OPEN)
+        row.update(extras.get(sym, {}))
+        rows.append(row)
         c = cs[i]
         pct = (c["c"] / c["o"] - 1) * 100 if c["o"] else 0
+        mark = "🔥 " if abs(pct) >= STRONG_CANDLE_PCT else ""
         lines.append(
-            f"{info['base']}: объём {money(s['vol'])} | норма {money(s['norm'])} | "
+            f"{mark}{info['base']}: объём {money(s['vol'])} | норма {money(s['norm'])} | "
             f"+{(s['mult'] - 1) * 100:.0f}% (×{s['mult']:.1f}) | свеча {pct:+.1f}% | кап {money(info['cap'])}"
         )
     write_csv(SIGNALS_FILE, rows)
-    tg("🔊 Аномальный объём (последняя 4ч свеча):\n" + "\n".join(lines)
-       + "\n\nНаправление неизвестно: смотри график и ликвидность.")
+    lines.sort(key=lambda x: not x.startswith("🔥"))
+    head = "🔊 Аномальный объём (последняя 4ч свеча), 🔥 = свеча от 7%:\n"
+    tail = "\n\nНаправление неизвестно: смотри график и ликвидность."
+    for k in range(0, len(lines), 15):
+        tg(head + "\n".join(lines[k:k + 15]) + (tail if k + 15 >= len(lines) else ""))
 
 
 def cmd_check():
