@@ -2,8 +2,9 @@
 
 Для каждого 4-часового сигнала основного фильтра (вспышка от ×3, свеча от 4%, капа $1–400 млн; берутся из history_events.csv):
 1) смотрим, обновила ли сигнальная свеча максимум / минимум предыдущих N свечей (N = 1, 6, 30, 90);
-2) ставим условный ордер на СЕРЕДИНУ сигнальной свечи (середина между её максимумом и минимумом)
-   и считаем ОБА варианта, и лонг, и шорт (какой брать, решим уже при анализе по правилу);
+2) ставим условный ордер в трёх вариантах: середина свечи (между максимумом и минимумом),
+   середина тела (между открытием и закрытием) и POC свечи (цена, где прошёл наибольший объём, по минуткам);
+   для каждого считаем ОБА варианта, и лонг, и шорт (какой брать, решим уже при анализе по правилу);
 3) ордер срабатывает, когда цена после закрытия сигнальной свечи доходит до середины (по 15-минуткам);
 4) после входа смотрим 10 суток: когда достигнуты тейки +5/7/10/12/15%, какая была максимальная просадка
    против позиции до тейка (стоп не ставим), и чем всё закончилось через 10 суток.
@@ -23,6 +24,8 @@ FILL_MAX_C = 480                  # ждём касания середины н�
 HOLD_C = 960                      # после входа следим 10 суток
 FOLLOW_C = FILL_MAX_C + HOLD_C    # всего скачиваем 15 суток 15-минуток
 STEP = 900
+ENTRIES = ("mid", "body", "poc")  # середина свечи (с тенями) / середина тела / POC свечи (цена с наибольшим объёмом)
+POC_BINS = 50
 
 
 def klines(symbol, interval, start_s, limit):
@@ -79,6 +82,24 @@ def swings(prev):
     return out
 
 
+def poc_of(symbol, ts, lo, hi):
+    """POC сигнальной свечи: по минутным свечам раскладываем объём по ценам и берём уровень с наибольшим объёмом."""
+    m1 = get_json(SPOT + "/api/v3/klines", symbol=symbol, interval="1m", limit=240, startTime=int(ts) * 1000)
+    if not m1 or hi <= lo:
+        return ""
+    step = (hi - lo) / POC_BINS
+    vol = [0.0] * POC_BINS
+    for k in m1:
+        h, l, v = float(k[2]), float(k[3]), float(k[7])
+        a = min(POC_BINS - 1, max(0, int((l - lo) / step)))
+        b = min(POC_BINS - 1, max(0, int((h - lo) / step)))
+        share = v / (b - a + 1)
+        for j in range(a, b + 1):
+            vol[j] += share
+    j = max(range(POC_BINS), key=lambda x: vol[x])
+    return lo + (j + 0.5) * step
+
+
 def find_fill(cs, close, mid):
     """Индекс первой 15-минутки, где цена дошла до середины (в том числе через гэп)."""
     if close == mid:
@@ -90,7 +111,7 @@ def find_fill(cs, close, mid):
     return None
 
 
-def simulate(cs, i_fill, entry, side, now):
+def simulate(cs, i_fill, entry, side, now, pre=""):
     """Что было после входа. side = 'L' или 'S'. Следим 10 суток, стопа нет."""
     after = [c for c in cs[i_fill + 1:i_fill + 1 + HOLD_C] if c["t"] + STEP <= now]
     fill_c = cs[i_fill]
@@ -98,6 +119,7 @@ def simulate(cs, i_fill, entry, side, now):
     fav = lambda c: ((c["h"] / entry - 1) if side == "L" else (1 - c["l"] / entry)) * 100
     adv = lambda c: ((c["l"] / entry - 1) if side == "L" else (1 - c["h"] / entry)) * 100
     res = {}
+    P = pre + side
     # свеча входа: порядок внутри неё неизвестен, учитываем только её закрытие как возможный минус
     run_adv = min(0.0, (fill_c["c"] / entry - 1) * 100 * sgn)
     hit = {}
@@ -111,16 +133,16 @@ def simulate(cs, i_fill, entry, side, now):
                 hit[tp] = (k + 1, run_adv)   # просадка включает свечу, где взят тейк (консервативно)
     for tp in TPS:
         if tp in hit:
-            res[f"{side}_tp{tp}_h"] = round((hit[tp][0]) * STEP / 3600, 2)
-            res[f"{side}_mae{tp}"] = rnd(hit[tp][1])
+            res[f"{P}_tp{tp}_h"] = round((hit[tp][0]) * STEP / 3600, 2)
+            res[f"{P}_mae{tp}"] = rnd(hit[tp][1])
         else:
-            res[f"{side}_tp{tp}_h"] = ""
-            res[f"{side}_mae{tp}"] = rnd(run_adv)   # тейка не было: худшая просадка за весь период
-    res[f"{side}_best"] = rnd(best)
-    res[f"{side}_worst"] = rnd(run_adv)
+            res[f"{P}_tp{tp}_h"] = ""
+            res[f"{P}_mae{tp}"] = rnd(run_adv)   # тейка не было: худшая просадка за весь период
+    res[f"{P}_best"] = rnd(best)
+    res[f"{P}_worst"] = rnd(run_adv)
     if after:
-        res[f"{side}_end"] = rnd((after[-1]["c"] / entry - 1) * 100 * sgn)
-    res[f"{side}_full"] = "да" if len(after) >= HOLD_C else "нет"
+        res[f"{P}_end"] = rnd((after[-1]["c"] / entry - 1) * 100 * sgn)
+    res[f"{P}_full"] = "да" if len(after) >= HOLD_C else "нет"
     return res
 
 
@@ -135,48 +157,66 @@ def analyze(row, now):
     out = {"coin": row["coin"], "symbol": sym, "time_kyiv": kyiv_str(ts), "candle_ts": ts,
            "candle_pct": row.get("candle_pct", ""), "above_x": row.get("above_x", ""),
            "cap_usd": row.get("cap_usd", ""), "close": sig["c"], "hi": sig["h"], "lo": sig["l"]}
-    mid = (sig["h"] + sig["l"]) / 2
-    out["mid"] = mid
-    out["mid_vs_close_pct"] = rnd((mid / sig["c"] - 1) * 100)
+    out["open"] = sig["o"]
+    levels = {"mid": (sig["h"] + sig["l"]) / 2, "body": (sig["o"] + sig["c"]) / 2}
+    try:
+        levels["poc"] = poc_of(sym, ts, sig["l"], sig["h"])
+    except Exception as e:
+        print("POC не посчитан", sym, e)
+        levels["poc"] = ""
+    for e in ENTRIES:
+        out[e] = levels[e]
     out.update(flags(prev, sig))
     out.update(swings(prev))
     cs = [c for c in klines15(sym, ts + CANDLE_S) if c["t"] + STEP <= now]
-    if not cs:
-        out["filled"] = ""
-        return out
-    i = find_fill(cs, sig["c"], mid)
-    if i is None:
-        out["filled"] = "нет"
-        return out
-    out["filled"] = "да"
-    out["fill_h"] = round((i + 1) * STEP / 3600, 2)
-    for side in ("L", "S"):
-        out.update(simulate(cs, i, mid, side, now))
+    for e in ENTRIES:
+        lv = levels[e]
+        if not cs or lv == "":
+            out[f"{e}_filled"] = ""
+            continue
+        i = find_fill(cs, sig["c"], lv)
+        if i is None:
+            out[f"{e}_filled"] = "нет"
+            continue
+        out[f"{e}_filled"] = "да"
+        out[f"{e}_fill_h"] = round((i + 1) * STEP / 3600, 2)
+        for side in ("L", "S"):
+            out.update(simulate(cs, i, lv, side, now, pre=e + "_"))
     return out
 
 
 def columns():
-    cols = ["coin", "symbol", "time_kyiv", "candle_ts", "candle_pct", "above_x", "cap_usd", "close", "hi", "lo",
-            "mid", "mid_vs_close_pct"]
+    cols = ["coin", "symbol", "time_kyiv", "candle_ts", "candle_pct", "above_x", "cap_usd", "open", "close", "hi", "lo",
+            "mid", "body", "poc"]
     for n in LOOKS:
         cols += [f"ph{n}", f"pl{n}", f"hi{n}", f"lo{n}"]
     for k in PIVOTS:
         cols += [f"sh{k}", f"sl{k}"]
-    cols += ["filled", "fill_h"]
-    for side in ("L", "S"):
-        for tp in TPS:
-            cols += [f"{side}_tp{tp}_h", f"{side}_mae{tp}"]
-        cols += [f"{side}_best", f"{side}_worst", f"{side}_end", f"{side}_full"]
+    for e in ENTRIES:
+        cols += [f"{e}_filled", f"{e}_fill_h"]
+        for side in ("L", "S"):
+            for tp in TPS:
+                cols += [f"{e}_{side}_tp{tp}_h", f"{e}_{side}_mae{tp}"]
+            cols += [f"{e}_{side}_best", f"{e}_{side}_worst", f"{e}_{side}_end", f"{e}_{side}_full"]
     return cols
 
 
 def ru(c):
     names = {"coin": "Монета", "symbol": "Пара", "time_kyiv": "Свеча (Киев)", "candle_ts": "Метка свечи",
              "candle_pct": "Свеча (%)", "above_x": "Выше нормы (×)", "cap_usd": "Капитализация ($)",
-             "close": "Закрытие свечи", "hi": "Максимум свечи", "lo": "Минимум свечи", "mid": "Середина свечи (вход)",
-             "mid_vs_close_pct": "Середина к закрытию (%)", "filled": "Ордер сработал", "fill_h": "Часов до входа"}
+             "open": "Открытие свечи", "close": "Закрытие свечи", "hi": "Максимум свечи", "lo": "Минимум свечи",
+             "mid": "Вход: середина свечи", "body": "Вход: середина тела", "poc": "Вход: POC свечи"}
     if c in names:
         return names[c]
+    EN = {"mid": "СЕРЕДИНА", "body": "ТЕЛО", "poc": "POC"}
+    e0 = c.split("_")[0]
+    if e0 in EN:
+        rest = c[len(e0) + 1:]
+        if rest == "filled":
+            return f"{EN[e0]}: ордер сработал"
+        if rest == "fill_h":
+            return f"{EN[e0]}: часов до входа"
+        return f"{EN[e0]} " + ru(rest)
     if c[:2] == "sh":
         return f"Последний пик структуры (K={c[2:]})"
     if c[:2] == "sl":
@@ -222,8 +262,7 @@ def main():
             _save(cols, res)
         time.sleep(0.15)
     _save(cols, res)
-    filled = sum(1 for r in res if r.get("filled") == "да")
-    msg = f"✅ mid15: готово, сигналов {len(res)}, ордер сработал в {filled}, файл {OUT}"
+    msg = f"✅ mid15: готово, сигналов {len(res)}, файл {OUT}"
     print(msg)
     tg(msg)
 
